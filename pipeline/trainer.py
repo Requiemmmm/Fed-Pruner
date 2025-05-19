@@ -70,9 +70,15 @@ class DistillTrainer(DefaultTrainer):
         self.start_sparsity = 1.
         self.target_sparsity = self.args.target_sparsity
 
+        # Initialize loss trackers for monitoring
+        self.last_l_pred = 0.0
+        self.last_l_layer = 0.0
+        self.last_distill_loss = 0.0
+        self.step_count = 0
+        self.log_interval = 100  # Log less frequently to avoid terminal clutter
+
         self.reg_params = []
 
-    
         self.per_layer_mask_groups: List[Tuple[Mask, ...]] = []
         self.init_reg_params()
         self.ffn_masks: List[Mask] = []
@@ -162,9 +168,20 @@ class DistillTrainer(DefaultTrainer):
               **kwargs
               ):
         self.distill_switch = True
+        # Reset loss tracking metrics at the start of training
+        self.last_l_pred = 0.0
+        self.last_l_layer = 0.0
+        self.last_distill_loss = 0.0
+        self.step_count = 0
+        
+        logger.info("Starting training with distillation...")
+        logger.info(f"Distillation parameters: T={self.args.distill_T}, lambda={self.args.distill_lambda}")
+        
         result = super().train(resume_from_checkpoint, trial, ignore_keys_for_eval, **kwargs)
         self.distill_switch = False
 
+        # Only log final loss values
+        logger.info(f"Final training losses - L_pred: {self.last_l_pred:.6f}, L_layer: {self.last_l_layer:.6f}, Combined: {self.last_distill_loss:.6f}")
 
         return result
 
@@ -204,14 +221,29 @@ class DistillTrainer(DefaultTrainer):
 
         # Distill Loss
         if self.distill_switch:
-            distill_loss = self.compute_distill_loss(
+            distill_loss, l_pred, l_layer = self.compute_distill_loss(
                 unwrap_model(model),
                 inputs,
                 outputs["logits"],
-                outputs["hidden_states"]
+                outputs["hidden_states"],
+                return_components=True
             )
+            
+            # Store the loss components for logging
+            self.last_l_pred = l_pred.item()
+            self.last_l_layer = l_layer.item()
+            self.last_distill_loss = distill_loss.item()
+            
+            # Increment step counter and log periodically (only log once per epoch or very infrequently)
+            self.step_count += 1
+            if self.step_count % self.log_interval == 0:
+                sparsity = self.compute_sparsity().item()
+                logger.info(f"Step {self.step_count} - L_pred: {self.last_l_pred:.6f}, L_layer: {self.last_l_layer:.6f}, "
+                          f"Combined: {self.last_distill_loss:.6f}, Sparsity: {sparsity:.4f}")
+            
             if self.args.distill:
                 loss = 0. * loss + distill_loss
+            
         # Lagrangian Loss
         if self.distill_switch:
             lagrangian_loss = self.compute_lagrangian_loss()
@@ -234,6 +266,7 @@ class DistillTrainer(DefaultTrainer):
                              inputs: Dict,
                              s_logits: torch.Tensor,
                              s_hidden_states: torch.Tensor,
+                             return_components: bool = False
                              ):
         with torch.no_grad():
             assert "output_hidden_states" in inputs and inputs["output_hidden_states"] is True
@@ -280,6 +313,8 @@ class DistillTrainer(DefaultTrainer):
 
         distill_loss = distill_lambda * pred_loss + (1.0 - distill_lambda) * layer_loss
 
+        if return_components:
+            return distill_loss, pred_loss, layer_loss
         return distill_loss
     
     def compute_target_sparsity(self):
@@ -325,6 +360,44 @@ class DistillTrainer(DefaultTrainer):
                  ignore_keys: Optional[List[str]] = None,
                  metric_key_prefix: str = "eval"
                  ) -> Dict[str, float]:
+        # First calculate the current loss values for the student model
+        # Save current distill switch state
+        orig_distill_switch = self.distill_switch
+        
+        # Temporarily enable distillation to compute proper loss values
+        self.distill_switch = True
+        
+        # Calculate current loss values on a sample batch if we're evaluating
+        if eval_dataset is not None and hasattr(self, "t_model") and self.t_model is not None:
+            # Get a small sample batch for loss calculation
+            eval_dataloader = self.get_eval_dataloader(eval_dataset)
+            if len(eval_dataloader) > 0:
+                try:
+                    # Get one batch of data
+                    batch = next(iter(eval_dataloader))
+                    batch = self._prepare_inputs(batch)
+                    
+                    # Forward pass through student model
+                    with torch.no_grad():
+                        outputs = self.model(**batch, output_hidden_states=True)
+                        
+                        # Compute distillation loss components
+                        _, l_pred, l_layer = self.compute_distill_loss(
+                            unwrap_model(self.model),
+                            batch,
+                            outputs["logits"],
+                            outputs["hidden_states"],
+                            return_components=True
+                        )
+                        
+                        # Update loss trackers with current values
+                        self.last_l_pred = l_pred.item()
+                        self.last_l_layer = l_layer.item()
+                        self.last_distill_loss = self.args.distill_lambda * l_pred.item() + (1.0 - self.args.distill_lambda) * l_layer.item()
+                except Exception as e:
+                    logger.warning(f"Failed to compute updated loss values: {e}")
+        
+        # Log evaluation parameters
         if self.args.local_rank == 0:
             with torch.no_grad():
                 lambda_1 = self.model.bert.reg_lambda_1.item()
@@ -332,23 +405,27 @@ class DistillTrainer(DefaultTrainer):
                 sparsity = self.compute_sparsity()
                 t_sparsity = self.compute_target_sparsity()
                 lagrangian_loss = self.compute_lagrangian_loss()
-                logger.info("lambda-1: {}".format(lambda_1))
-                logger.info("lambda-2: {}".format(lambda_2))
-                logger.info("sparsity = {}".format(sparsity))
-                logger.info("t_sparsity = {}".format(t_sparsity))
-                logger.info("lagrangian_loss = {}".format(lagrangian_loss))
-                #time = str(datetime.datetime.now())
-                #sparsity_ = np.array(sparsity.cpu())
-                #np.save(time, sparsity_)
+                
+                # Comprehensive single log instead of multiple lines
+                logger.info(f"Evaluation parameters - lambda-1: {lambda_1:.6f}, lambda-2: {lambda_2:.6f}, "
+                          f"sparsity: {sparsity:.6f}, target: {t_sparsity:.6f}, lag_loss: {lagrangian_loss:.6f}")
+                
+                # Always log loss components during evaluation now that we've properly computed them
+                logger.info(f"Distill losses - L_pred: {self.last_l_pred:.6f}, L_layer: {self.last_l_layer:.6f}, "
+                         f"Combined: {self.last_distill_loss:.6f}")
 
-        past_distill_switch = self.distill_switch
+        # Reset distill switch to its original state for the actual evaluation
         self.distill_switch = False
-        results = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
-        self.distill_switch = past_distill_switch
         
-        with torch.no_grad():
-            results['sparsity'] = self.compute_sparsity()
-            
-        #print("best_result: ", self.best_result)
+        # Run standard evaluation
+        results = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+        
+        # Restore original distill switch state
+        self.distill_switch = orig_distill_switch
+        
+        # Add loss components to results
+        results['l_pred'] = self.last_l_pred
+        results['l_layer'] = self.last_l_layer
+        results['sparsity'] = self.compute_sparsity().item()
  
         return results
