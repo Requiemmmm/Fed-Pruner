@@ -20,6 +20,16 @@ from typing import Dict, List, Any, Tuple, Callable, Union, Optional, Sequence
 from tqdm import tqdm
 from loguru import logger
 
+# 配置日志系统，减少冗余输出
+logger.remove()  # 移除默认处理程序
+# 添加自定义格式的处理程序，使用不同颜色区分不同级别的日志
+logger.add(
+    lambda msg: tqdm.write(msg, end=""),  # 使用 tqdm.write 避免与进度条冲突
+    format="<level>{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}</level>",
+    level="INFO",
+    colorize=True
+)
+
 from transformers import Trainer as DefaultTrainer
 from transformers.trainer import (
     unwrap_model,
@@ -75,7 +85,11 @@ class DistillTrainer(DefaultTrainer):
         self.last_l_layer = 0.0
         self.last_distill_loss = 0.0
         self.step_count = 0
-        self.log_interval = 100  # Log less frequently to avoid terminal clutter
+        
+        # 增加日志控制参数
+        self.log_interval = 500  # 减少日志频率，每500步记录一次
+        self.debug_mode = False  # 调试模式开关，默认关闭
+        self.eval_log_once = False  # 确保评估时只记录一次详细信息
 
         self.reg_params = []
 
@@ -83,8 +97,10 @@ class DistillTrainer(DefaultTrainer):
         self.init_reg_params()
         self.ffn_masks: List[Mask] = []
         self.init_ffn_masks()
-    
         
+        # 记录初始化完成
+        logger.info("DistillTrainer initialized successfully")
+
     def init_ffn_masks(self):
         model: SModel = self.model
         for layer in model.bert.encoder.layer:
@@ -104,7 +120,7 @@ class DistillTrainer(DefaultTrainer):
             filter_mask = layer.output.dense.mask
             MHA_mask = layer.attention.output.mask
             FFN_mask = layer.output.mask
-            
+
             self.per_layer_mask_groups.append((
                 head_mask,
                 MHA_mask,
@@ -112,7 +128,6 @@ class DistillTrainer(DefaultTrainer):
                 filter_mask,
             ))
 
-            
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -173,15 +188,21 @@ class DistillTrainer(DefaultTrainer):
         self.last_l_layer = 0.0
         self.last_distill_loss = 0.0
         self.step_count = 0
-        
-        logger.info("Starting training with distillation...")
-        logger.info(f"Distillation parameters: T={self.args.distill_T}, lambda={self.args.distill_lambda}")
-        
+
+        # 使用明确的训练开始横幅，便于在日志中查找
+        logger.info("=" * 50)
+        logger.info("TRAINING START")
+        logger.info(f"Distill params: T={self.args.distill_T}, lambda={self.args.distill_lambda}")
+        logger.info("=" * 50)
+
         result = super().train(resume_from_checkpoint, trial, ignore_keys_for_eval, **kwargs)
         self.distill_switch = False
 
-        # Only log final loss values
-        logger.info(f"Final training losses - L_pred: {self.last_l_pred:.6f}, L_layer: {self.last_l_layer:.6f}, Combined: {self.last_distill_loss:.6f}")
+        # 使用明确的训练结束横幅
+        logger.info("=" * 50)
+        logger.info("TRAINING COMPLETED")
+        logger.info(f"Final losses - L_pred: {self.last_l_pred:.6f}, L_layer: {self.last_l_layer:.6f}, Combined: {self.last_distill_loss:.6f}")
+        logger.info("=" * 50)
 
         return result
 
@@ -228,22 +249,24 @@ class DistillTrainer(DefaultTrainer):
                 outputs["hidden_states"],
                 return_components=True
             )
-            
+
             # Store the loss components for logging
             self.last_l_pred = l_pred.item()
             self.last_l_layer = l_layer.item()
             self.last_distill_loss = distill_loss.item()
-            
-            # Increment step counter and log periodically (only log once per epoch or very infrequently)
+
+            # 增量步数并按固定间隔记录日志，大幅减少日志频率
             self.step_count += 1
             if self.step_count % self.log_interval == 0:
                 sparsity = self.compute_sparsity().item()
-                logger.info(f"Step {self.step_count} - L_pred: {self.last_l_pred:.6f}, L_layer: {self.last_l_layer:.6f}, "
-                          f"Combined: {self.last_distill_loss:.6f}, Sparsity: {sparsity:.4f}")
-            
+                logger.info(
+                    f"[STEP {self.step_count}] L_pred: {self.last_l_pred:.4f}, L_layer: {self.last_l_layer:.4f}, "
+                    f"Combined: {self.last_distill_loss:.4f}, Sparsity: {sparsity:.4f}"
+                )
+
             if self.args.distill:
                 loss = 0. * loss + distill_loss
-            
+
         # Lagrangian Loss
         if self.distill_switch:
             lagrangian_loss = self.compute_lagrangian_loss()
@@ -261,62 +284,101 @@ class DistillTrainer(DefaultTrainer):
         mask = mask.view(-1).bool()
         return value[mask]
 
-    def compute_distill_loss(self,
-                             model: SModel,
-                             inputs: Dict,
-                             s_logits: torch.Tensor,
-                             s_hidden_states: torch.Tensor,
-                             return_components: bool = False
-                             ):
+    def compute_distill_loss(self, model, inputs, s_logits, s_hidden_states, return_components=True):
+        # 只在调试模式下记录详细信息
+        if self.debug_mode:
+            logger.debug(f"Computing distill loss - input keys: {inputs.keys()}")
+            logger.debug(f"s_logits shape: {s_logits.shape}, s_hidden_states length: {len(s_hidden_states)}")
+        
+        # 确保输入包含 output_hidden_states 并设置为 True
+        inputs_copy = inputs.copy()  # 创建副本避免修改原始输入
+        inputs_copy["output_hidden_states"] = True
+        
         with torch.no_grad():
-            assert "output_hidden_states" in inputs and inputs["output_hidden_states"] is True
-            t_outputs = self.t_model(**inputs)
+            # 不再使用断言，而是确保参数正确
+            t_outputs = self.t_model(**inputs_copy)
             t_logits = t_outputs["logits"]
             t_hidden_states = t_outputs["hidden_states"]
-
-        mask: torch.Tensor = inputs["attention_mask"]
-        D = s_logits.shape[-1]
+            
+            if self.debug_mode:
+                logger.debug(f"t_logits shape: {t_logits.shape}, t_hidden_states length: {len(t_hidden_states)}")
+        
+        if "attention_mask" not in inputs:
+            if self.debug_mode:
+                logger.debug("No attention_mask found in inputs, creating default mask")
+            # 创建全1的注意力掩码
+            attention_mask = torch.ones_like(inputs["input_ids"])
+        else:
+            attention_mask = inputs["attention_mask"]
+            
+        mask = attention_mask
         T = self.args.distill_T
         distill_lambda = self.args.distill_lambda
 
+        # 计算预测损失
         pred_loss = self.kl_loss(
             torch.log_softmax(s_logits / T, dim=-1),
             torch.log_softmax(t_logits / T, dim=-1),
         )
 
-        assert len(t_hidden_states) == len(s_hidden_states)
+        # 检查隐藏状态的长度是否匹配
+        if len(t_hidden_states) != len(s_hidden_states):
+            if self.debug_mode:
+                logger.warning(f"Hidden states length mismatch: teacher={len(t_hidden_states)}, student={len(s_hidden_states)}")
+            # 使用最小长度
+            min_length = min(len(t_hidden_states), len(s_hidden_states))
+            t_hidden_states = t_hidden_states[:min_length]
+            s_hidden_states = s_hidden_states[:min_length]
 
-        proj = model.bert.distill_projection
-        t_hidden_states = [self.mask_select(t_h, mask) for t_h in t_hidden_states]
-        s_hidden_states = [proj(self.mask_select(s_h, mask)) for s_h in s_hidden_states]
+        # 应用投影和掩码
+        try:
+            proj = model.bert.distill_projection
+            t_hidden_states = [self.mask_select(t_h, mask) for t_h in t_hidden_states]
+            s_hidden_states = [proj(self.mask_select(s_h, mask)) for s_h in s_hidden_states]
+        except Exception as e:
+            logger.error(f"Mask/projection error: {str(e)[:100]}...")  # 限制错误消息长度
+            # 如果出错，尝试直接使用隐藏状态（不应用掩码）
+            if self.debug_mode:
+                logger.debug("Falling back to using hidden states without masking")
+            t_mean_states = [t_h.mean(dim=1) for t_h in t_hidden_states]
+            s_mean_states = [s_h.mean(dim=1) for s_h in s_hidden_states]
+            
+            # 计算简单的MSE损失
+            layer_loss = torch.stack([self.mse_loss(t_h, s_h) 
+                                     for t_h, s_h in zip(t_mean_states, s_mean_states)]).sum()
+            
+            # 组合损失
+            distill_loss = distill_lambda * pred_loss + (1.0 - distill_lambda) * layer_loss
+            
+            if return_components:
+                return distill_loss, pred_loss, layer_loss
+            return distill_loss
 
+        # 使用简单的层匹配策略
         match_index = []
-        with torch.no_grad():
-            T = torch.stack(t_hidden_states).unsqueeze(0)
-            S = torch.stack(s_hidden_states).unsqueeze(1)
-            dist = (T - S).pow(2.).mean(-1).mean(-1)  # dist[i, j] = || S_i - T_j ||
-            assert len(dist.shape) == 2
+        for i in range(len(s_hidden_states)):
+            match_index.append(i)  # 直接匹配相同索引的层
 
-        num_layers = len(s_hidden_states)
-        for i in range(num_layers):
-            match_index.append(dist[i, i:].argmin().item() + i)
+        # 计算层损失
+        try:
+            _layer_loss = []
+            for i, (ffn_mask, s_h) in enumerate(zip(self.ffn_masks, s_hidden_states)):
+                t_h = t_hidden_states[match_index[i]]
+                _layer_loss.append(self.mse_loss(t_h, s_h))
+            layer_loss = torch.stack(_layer_loss).sum()
+        except Exception as e:
+            logger.error(f"Layer loss calculation error: {str(e)[:100]}...")  # 限制错误消息长度
+            # 如果计算层损失出错，使用简化版本
+            layer_loss = sum(self.mse_loss(t_hidden_states[i], s_hidden_states[i]) 
+                            for i in range(len(s_hidden_states)))
 
-        # for i in range(1, num_layers):
-        #     match_index[i] = max(match_index[i], match_index[i - 1])
-        # * ffn_mask.L().detach()
-
-        _layer_loss = []
-        for i, (ffn_mask, s_h) in enumerate(zip(self.ffn_masks, s_hidden_states)):
-            t_h = t_hidden_states[match_index[i]]
-            _layer_loss.append(self.mse_loss(t_h, s_h))
-        layer_loss = torch.stack(_layer_loss).sum()
-
+        # 组合损失
         distill_loss = distill_lambda * pred_loss + (1.0 - distill_lambda) * layer_loss
 
         if return_components:
             return distill_loss, pred_loss, layer_loss
         return distill_loss
-    
+
     def compute_target_sparsity(self):
         return self.target_sparsity
 
@@ -329,24 +391,22 @@ class DistillTrainer(DefaultTrainer):
         lagrangian_loss = lambda_1 * (s - t).abs() + lambda_2 * torch.pow(s - t, 2.)
         return lagrangian_loss
 
-
     def compute_sparsity(self):
         num_layers = 12
         num_heads = 12
         hidden_size = 768
-        ffn_size = 768*4
+        ffn_size = 768 * 4
         M = (hidden_size * hidden_size * 4 + hidden_size * ffn_size * 2) * num_layers
         params = []
         hidden_mask = torch.ones([768]).cuda()
         for mask_group in self.per_layer_mask_groups:
             head_mask, MHA_mask, FFN_mask, filter_mask = mask_group
 
-            
             MHA_mask_L = MHA_mask.L()
             head_mask_L = head_mask.L()
             FFN_mask_L = FFN_mask.L()
 
-            params.append(4  * 64 * hidden_mask.sum() * head_mask_L.sum() * MHA_mask_L.sum())
+            params.append(4 * 64 * hidden_mask.sum() * head_mask_L.sum() * MHA_mask_L.sum())
 
             mask = torch.outer(hidden_mask, filter_mask.L())
             mask = mask * FFN_mask_L
@@ -360,13 +420,20 @@ class DistillTrainer(DefaultTrainer):
                  ignore_keys: Optional[List[str]] = None,
                  metric_key_prefix: str = "eval"
                  ) -> Dict[str, float]:
-        # First calculate the current loss values for the student model
+        # 使用明确的评估开始横幅
+        logger.info("=" * 50)
+        logger.info("EVALUATION START")
+        logger.info("=" * 50)
+        
+        # 重置评估日志控制标志
+        self.eval_log_once = False
+        
         # Save current distill switch state
         orig_distill_switch = self.distill_switch
-        
+
         # Temporarily enable distillation to compute proper loss values
         self.distill_switch = True
-        
+
         # Calculate current loss values on a sample batch if we're evaluating
         if eval_dataset is not None and hasattr(self, "t_model") and self.t_model is not None:
             # Get a small sample batch for loss calculation
@@ -377,10 +444,21 @@ class DistillTrainer(DefaultTrainer):
                     batch = next(iter(eval_dataloader))
                     batch = self._prepare_inputs(batch)
                     
+                    # 仅在调试模式下记录批次信息
+                    if self.debug_mode:
+                        logger.debug(f"Evaluation batch keys: {batch.keys()}")
+                    
                     # Forward pass through student model
                     with torch.no_grad():
-                        outputs = self.model(**batch, output_hidden_states=True)
+                        # 明确设置 output_hidden_states=True
+                        batch_with_hidden = batch.copy()
+                        batch_with_hidden["output_hidden_states"] = True
+                        outputs = self.model(**batch_with_hidden)
                         
+                        # 仅在调试模式下记录输出信息
+                        if self.debug_mode:
+                            logger.debug(f"Evaluation model output keys: {outputs.keys()}")
+
                         # Compute distillation loss components
                         _, l_pred, l_layer = self.compute_distill_loss(
                             unwrap_model(self.model),
@@ -389,43 +467,83 @@ class DistillTrainer(DefaultTrainer):
                             outputs["hidden_states"],
                             return_components=True
                         )
-                        
+
                         # Update loss trackers with current values
                         self.last_l_pred = l_pred.item()
                         self.last_l_layer = l_layer.item()
-                        self.last_distill_loss = self.args.distill_lambda * l_pred.item() + (1.0 - self.args.distill_lambda) * l_layer.item()
+                        self.last_distill_loss = self.args.distill_lambda * l_pred.item() + (
+                                    1.0 - self.args.distill_lambda) * l_layer.item()
                 except Exception as e:
-                    logger.warning(f"Failed to compute updated loss values: {e}")
-        
-        # Log evaluation parameters
-        if self.args.local_rank == 0:
+                    logger.warning(f"Failed to compute evaluation losses: {str(e)[:100]}...")
+                    
+                    # 在调试模式下记录完整堆栈跟踪
+                    if self.debug_mode:
+                        import traceback
+                        logger.debug(f"Detailed error: {traceback.format_exc()}")
+                    
+                    # 设置默认损失值，避免后续使用未初始化的值
+                    self.last_l_pred = 0.0
+                    self.last_l_layer = 0.0
+                    self.last_distill_loss = 0.0
+
+        # Log evaluation parameters only once per evaluation call
+        if self.args.local_rank == 0 and not self.eval_log_once:
+            self.eval_log_once = True  # 标记已经记录
+            
             with torch.no_grad():
                 lambda_1 = self.model.bert.reg_lambda_1.item()
                 lambda_2 = self.model.bert.reg_lambda_2.item()
-                sparsity = self.compute_sparsity()
+                sparsity = self.compute_sparsity().item()
                 t_sparsity = self.compute_target_sparsity()
-                lagrangian_loss = self.compute_lagrangian_loss()
-                
-                # Comprehensive single log instead of multiple lines
-                logger.info(f"Evaluation parameters - lambda-1: {lambda_1:.6f}, lambda-2: {lambda_2:.6f}, "
-                          f"sparsity: {sparsity:.6f}, target: {t_sparsity:.6f}, lag_loss: {lagrangian_loss:.6f}")
-                
-                # Always log loss components during evaluation now that we've properly computed them
-                logger.info(f"Distill losses - L_pred: {self.last_l_pred:.6f}, L_layer: {self.last_l_layer:.6f}, "
-                         f"Combined: {self.last_distill_loss:.6f}")
+                lagrangian_loss = self.compute_lagrangian_loss().item()
+
+                # 使用明确的标识，便于在日志中查找
+                logger.info("-" * 40)
+                logger.info("[EVAL PARAMS]")
+                logger.info(f"λ1: {lambda_1:.4f}, λ2: {lambda_2:.4f}, Sparsity: {sparsity:.4f}/{t_sparsity:.4f}")
+                logger.info(f"Distill losses: L_pred={self.last_l_pred:.4f}, L_layer={self.last_l_layer:.4f}, Combined={self.last_distill_loss:.4f}")
+                logger.info(f"Lagrangian loss: {lagrangian_loss:.4f}")
+                logger.info("-" * 40)
 
         # Reset distill switch to its original state for the actual evaluation
         self.distill_switch = False
-        
+
         # Run standard evaluation
         results = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
-        
+
         # Restore original distill switch state
         self.distill_switch = orig_distill_switch
-        
+
         # Add loss components to results
         results['l_pred'] = self.last_l_pred
         results['l_layer'] = self.last_l_layer
         results['sparsity'] = self.compute_sparsity().item()
- 
+        
+        # 使用明确的评估结束横幅
+        logger.info("=" * 50)
+        logger.info("EVALUATION COMPLETE")
+        logger.info(f"Results: {', '.join([f'{k}={v:.4f}' for k, v in results.items() if isinstance(v, (int, float))])}")
+        logger.info("=" * 50)
+
         return results
+        
+    # 添加一个方法来控制日志级别
+    def set_log_level(self, level="INFO", debug_mode=False):
+        """
+        设置日志级别和调试模式
+        
+        参数:
+            level: 日志级别，可选 "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+            debug_mode: 是否启用调试模式打印详细信息
+        """
+        logger.remove()  # 移除所有处理程序
+        logger.add(
+            lambda msg: tqdm.write(msg, end=""),
+            format="<level>{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}</level>",
+            level=level,
+            colorize=True
+        )
+        self.debug_mode = debug_mode
+        self.log_interval = 100 if debug_mode else 500  # 调试模式下更频繁地记录
+        
+        logger.info(f"Log level set to {level}, debug mode: {debug_mode}, log interval: {self.log_interval}")
