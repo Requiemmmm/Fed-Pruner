@@ -29,27 +29,32 @@ from .args import (
     ModelArguments,
 )
 
-# 量化工具导入（可选，防止导入错误）
 try:
     from .quantization_utils import (
-        quantize_model_dynamic,
-        quantize_model_static,
+        # 使用实际存在的函数名
+        quantize_state_dict_real,
+        dequantize_state_dict_real,
+        serialize_quantized_weights,
+        deserialize_quantized_weights,
+        measure_real_communication_savings,
         get_calibration_dataloader,
-        simulate_quantization_communication_cost,
-        dequantize_model_weights,
+        simulate_quantization_communication_cost,  # 保持兼容性
         get_model_size_info,
         QuantizationConfig
     )
+
     QUANTIZATION_AVAILABLE = True
-except ImportError:
+    logging.info("✅ Quantization utilities loaded successfully!")
+except ImportError as e:
     QUANTIZATION_AVAILABLE = False
-    logging.warning("Quantization utilities not available. Quantization features disabled.")
+    logging.warning(f"❌ Quantization import failed: {e}")
+    logging.warning("Quantization features disabled.")
 
 from copy import deepcopy
 
 Trainers = Union[Trainer, DistillTrainer]
 
-# 设置日志
+# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -117,8 +122,8 @@ class Client():
         self.distill_args = get_distill_args(training_args)
         self.distill_args.num_train_epochs = 1
         self.distill_args.gradient_accumulation_steps = 4
-        
-        # 量化配置初始化（保守设置）
+
+        # Initialize quantization config
         self.quantization_config = None
         if QUANTIZATION_AVAILABLE:
             try:
@@ -130,7 +135,6 @@ class Client():
                         calibration_batch_size=getattr(training_args, 'calibration_batch_size', 8),
                         num_calibration_batches=getattr(training_args, 'num_calibration_batches', 10)
                     )
-                    # 保守的量化设置，避免影响训练稳定性
                     self.quantization_config.validate()
                     logger.info(f"Quantization enabled: {self.quantization_config.quantization_type}")
             except Exception as e:
@@ -158,21 +162,18 @@ class Client():
         return {"accuracy": accuracy}
 
     def _create_safe_state_dict(self, model):
-        """创建安全的状态字典，确保所有参数都是叶子节点且数值稳定"""
+        """Creates a safe state dictionary, ensuring all parameters are leaf nodes and numerically stable."""
         safe_state_dict = {}
         for key, param in model.state_dict().items():
-            # 检查参数是否包含NaN或Inf
             if torch.isnan(param).any() or torch.isinf(param).any():
                 logger.warning(f"Parameter {key} contains NaN or Inf values, skipping client update")
                 return None
-                
+
             if param.requires_grad:
-                # 创建新的叶子张量，并确保梯度信息正确
                 safe_param = param.detach().clone()
-                # 检查数值范围，防止梯度爆炸
                 if safe_param.abs().max() > 100:
                     logger.warning(f"Parameter {key} has large values (max: {safe_param.abs().max()}), clipping")
-                    safe_param = torch.clamp(safe_param, -10, 10)
+                    safe_param = torch.clamp(safe_param, min=-10, max=10)
                 safe_param.requires_grad_(True)
                 safe_state_dict[key] = safe_param
             else:
@@ -180,76 +181,52 @@ class Client():
         return safe_state_dict
 
     def _apply_quantization_simulation(self, server_model, client_id, datasets):
-        """安全的量化模拟（仅用于分析，不影响训练）"""
+        """Performs safe quantization simulation for analysis only, without affecting training."""
         if not self.quantization_config or not self.quantization_config.apply_quantization:
             return
-            
+
         try:
             logger.info(f"Client {client_id}: Running quantization simulation (analysis only)...")
-            
-            # 获取当前状态字典用于通信成本分析
             current_state_dict = server_model.state_dict()
-            
-            # 仅进行通信成本模拟，不实际量化训练中的模型
+
             if QUANTIZATION_AVAILABLE:
                 comm_stats = simulate_quantization_communication_cost(current_state_dict)
-                logger.info(f"Client {client_id}: Simulated communication reduction: {comm_stats['compression_ratio']:.2f}x")
-                
-                # 模型大小信息
+                logger.info(
+                    f"Client {client_id}: Simulated communication reduction: {comm_stats['compression_ratio']:.2f}x")
                 try:
                     model_info = get_model_size_info(server_model)
                     logger.info(f"Client {client_id}: Model size: {model_info['model_size_mb']:.2f} MB")
                 except:
                     pass
-                    
         except Exception as e:
             logger.warning(f"Client {client_id}: Quantization simulation failed: {e}")
 
     def train_epoch(self, server_model, client_id, server_weights, t_model):
+        """A training epoch with real quantization."""
         datasets = self.client_train_datas[client_id]
-        
-        # 安全地加载权重
+
+        # Safely load weights
         try:
+            # If server_weights are quantized, dequantize them first
+            if isinstance(server_weights, dict) and any(isinstance(v, dict) and v.get('quantized', False)
+                                                        for v in server_weights.values()):
+                logger.info(f"Client {client_id}: Dequantizing received weights...")
+                server_weights = dequantize_state_dict_real(server_weights)
+
             server_model.load_state_dict(server_weights, strict=True)
         except Exception as e:
             logger.warning(f"Client {client_id}: Failed to load weights strictly: {e}")
             server_model.load_state_dict(server_weights, strict=False)
 
-        # 检查模型参数的数值稳定性
-        param_norms = []
-        for name, param in server_model.named_parameters():
-            if param.requires_grad:
-                param_norm = param.norm().item()
-                param_norms.append(param_norm)
-                if torch.isnan(param).any() or torch.isinf(param).any():
-                    logger.error(f"Client {client_id}: Parameter {name} contains NaN/Inf before training")
-                    return server_weights  # 返回原始权重，跳过这个客户端
-                if param_norm > 50:  # 参数范数过大
-                    logger.warning(f"Client {client_id}: Large parameter norm in {name}: {param_norm}")
-
-        avg_param_norm = np.mean(param_norms) if param_norms else 0
-        logger.info(f"Client {client_id}: Average parameter norm before training: {avg_param_norm:.4f}")
-
-        # 确保模型参数是叶子节点
-        for name, param in server_model.named_parameters():
-            if param.requires_grad and not param.is_leaf:
-                logger.warning(f"Client {client_id}: Fixing non-leaf parameter: {name}")
-                param.data = param.data.detach().clone()
-                param.requires_grad_(True)
-
-        # 创建训练器时使用更保守的设置
+        # Create trainer and execute training
         conservative_distill_args = deepcopy(self.distill_args)
-        
-        # 调整学习率，防止训练不稳定
         if hasattr(conservative_distill_args, 'learning_rate') and conservative_distill_args.learning_rate > 1e-4:
             conservative_distill_args.learning_rate = min(conservative_distill_args.learning_rate, 1e-4)
-        if hasattr(conservative_distill_args, 'distill_learning_rate') and conservative_distill_args.distill_learning_rate > 1e-4:
+        if hasattr(conservative_distill_args,
+                   'distill_learning_rate') and conservative_distill_args.distill_learning_rate > 1e-4:
             conservative_distill_args.distill_learning_rate = min(conservative_distill_args.distill_learning_rate, 1e-4)
-            
-        # 确保目标稀疏度不会过于激进
         if hasattr(conservative_distill_args, 'target_sparsity') and conservative_distill_args.target_sparsity > 0.9:
             conservative_distill_args.target_sparsity = 0.8
-            logger.info(f"Client {client_id}: Adjusted target sparsity to {conservative_distill_args.target_sparsity}")
 
         distill_trainer = DistillTrainer(
             server_model,
@@ -263,24 +240,12 @@ class Client():
         )
 
         try:
-            # 确保训练前模型状态正确
+            # Execute training
             server_model.train()
-            
-            # 训练前检查一次模型输出
-            with torch.no_grad():
-                sample_input = datasets[0]
-                inputs = self.tokenizer(sample_input['sentence'], return_tensors='pt', truncation=True, max_length=256)
-                inputs = {k: v.to(next(server_model.parameters()).device) for k, v in inputs.items()}
-                outputs = server_model(**inputs)
-                if torch.isnan(outputs.logits).any():
-                    logger.error(f"Client {client_id}: Model outputs NaN before training")
-                    return server_weights
-
-            # 执行训练
             distill_trainer.train()
             server_model.eval()
-            
-            # 训练后检查参数稳定性
+
+            # Post-training parameter check
             post_training_norms = []
             for name, param in server_model.named_parameters():
                 if param.requires_grad:
@@ -288,33 +253,60 @@ class Client():
                     post_training_norms.append(param_norm)
                     if torch.isnan(param).any() or torch.isinf(param).any():
                         logger.error(f"Client {client_id}: Parameter {name} contains NaN/Inf after training")
-                        return server_weights  # 返回原始权重
-                    if param_norm > 100:  # 参数范数过大，可能梯度爆炸
-                        logger.warning(f"Client {client_id}: Very large parameter norm in {name}: {param_norm}")
+                        return server_weights
 
             avg_post_norm = np.mean(post_training_norms) if post_training_norms else 0
             logger.info(f"Client {client_id}: Average parameter norm after training: {avg_post_norm:.4f}")
-            
-            # 如果参数变化过大，可能训练不稳定
-            if avg_post_norm > avg_param_norm * 10:
-                logger.warning(f"Client {client_id}: Large parameter change detected, may be unstable")
-            
-            # 量化模拟（仅用于分析，不影响实际权重）
-            self._apply_quantization_simulation(server_model, client_id, datasets)
-            
-            # 创建安全的权重字典
-            weight = self._create_safe_state_dict(server_model)
-            
-            if weight is None:  # 如果检测到NaN/Inf
+
+            # === Key Change: Real quantization implementation ===
+            trained_weights = self._create_safe_state_dict(server_model)
+            if trained_weights is None:
                 logger.error(f"Client {client_id}: Unsafe weights detected, returning original weights")
                 return server_weights
-            
-            logger.info(f"Client {client_id}: Training completed successfully")
-            return weight
-            
+
+            # 🔧 Apply real quantization
+            if (self.quantization_config and
+                    self.quantization_config.apply_quantization and
+                    QUANTIZATION_AVAILABLE):
+
+                logger.info(f"Client {client_id}: Applying real quantization to trained weights...")
+
+                # Perform real quantization
+                quantized_weights, compression_stats = quantize_state_dict_real(
+                    trained_weights, self.quantization_config
+                )
+
+                # Measure real communication savings
+                comm_savings = measure_real_communication_savings(trained_weights, quantized_weights)
+
+                logger.info(f"Client {client_id}: Real quantization results:")
+                logger.info(f"   📊 Compression: {compression_stats['compression_ratio']:.2f}x")
+                logger.info(
+                    f"   💾 Size reduction: {compression_stats['original_size_mb']:.2f}MB -> {compression_stats['quantized_size_mb']:.2f}MB")
+                logger.info(f"   📡 Communication savings: {comm_savings['savings_percentage']:.1f}%")
+                logger.info(
+                    f"   🔢 Quantized params: {compression_stats['quantized_params']}/{compression_stats['total_params']}")
+
+                # Return quantized or dequantized weights based on strategy
+                if hasattr(self.quantization_config, 'client_quantization_strategy'):
+                    if self.quantization_config.client_quantization_strategy == "send_quantized":
+                        logger.info(f"Client {client_id}: Sending quantized weights")
+                        return quantized_weights
+                    else:
+                        logger.info(f"Client {client_id}: Dequantizing weights before sending")
+                        dequantized_weights = dequantize_state_dict_real(quantized_weights)
+                        return dequantized_weights
+                else:
+                    # Default: dequantize before sending
+                    dequantized_weights = dequantize_state_dict_real(quantized_weights)
+                    return dequantized_weights
+            else:
+                # No quantization case
+                logger.info(f"Client {client_id}: Training completed without quantization")
+                return trained_weights
+
         except Exception as e:
             logger.error(f"Client {client_id}: Training failed: {e}")
-            # 训练失败时返回原始权重，而不是破坏的权重
             logger.info(f"Client {client_id}: Returning original weights due to training failure")
             return server_weights
 
@@ -354,15 +346,13 @@ class Server():
 
         self.data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer)
         self.best_result = 0
-        
-        # 添加准确率监控
+
         self.accuracy_history = []
-        self.accuracy_drop_threshold = 0.1  # 如果准确率下降超过10%，触发警告
-        
-        # 量化状态记录
-        self.quantization_enabled = (QUANTIZATION_AVAILABLE and 
-                                   hasattr(training_args, 'apply_quantization') and 
-                                   training_args.apply_quantization)
+        self.accuracy_drop_threshold = 0.1
+
+        self.quantization_enabled = (QUANTIZATION_AVAILABLE and
+                                     hasattr(training_args, 'apply_quantization') and
+                                     training_args.apply_quantization)
         if self.quantization_enabled:
             logger.info("Server: Quantization simulation enabled in federated learning")
             if QUANTIZATION_AVAILABLE:
@@ -371,6 +361,22 @@ class Server():
                     logger.info(f"Server: Global model size: {initial_size_info['model_size_mb']:.2f}MB")
                 except Exception as e:
                     logger.warning(f"Server: Could not get model size info: {e}")
+
+        # 🔧 修复7: 正确的剪枝调度策略
+        # 原问题：稀疏度策略逻辑反向，在减少而非增加稀疏度
+        self.initial_target_sparsity = 0.1  # 起始稀疏度：10%
+        self.final_target_sparsity = 0.8    # 最终稀疏度：80%
+        self.sparsity_schedule = 'gradual'   # 调度策略：渐进式
+        self.sparsity_patience = 3          # 稀疏度调整的耐心值
+        self.consecutive_drops = 0          # 连续下降次数
+        
+        # 新增：稀疏度增长控制参数
+        self.max_sparsity_increase_per_epoch = 0.05  # 每轮最大稀疏度增长
+        self.sparsity_adjustment_factor = 0.8        # 稀疏度调整因子
+        self.min_accuracy_threshold = 0.6            # 最低准确率阈值
+
+        logger.info(f"🎯 Pruning schedule: {self.initial_target_sparsity:.1f} → {self.final_target_sparsity:.1f}")
+        logger.info(f"📈 Max sparsity increase per epoch: {self.max_sparsity_increase_per_epoch:.2f}")
 
     def distribute_task(self, client_ids):
         server_weights = deepcopy(self.s_model.state_dict())
@@ -383,54 +389,131 @@ class Server():
 
         return client_weight_datas
 
-    def _validate_client_weights(self, client_weight_datas):
-        """验证客户端权重的有效性"""
-        valid_weights = []
-        for i, weights in enumerate(client_weight_datas):
-            is_valid = True
-            for key, param in weights.items():
-                if torch.isnan(param).any() or torch.isinf(param).any():
-                    logger.warning(f"Client {i} weights contain NaN/Inf in {key}, excluding from aggregation")
-                    is_valid = False
-                    break
-            if is_valid:
-                valid_weights.append(weights)
-            else:
-                logger.warning(f"Excluding client {i} from aggregation due to invalid weights")
-        
-        if len(valid_weights) == 0:
-            logger.error("No valid client weights for aggregation! This will cause training failure.")
-            return client_weight_datas  # 返回原始数据，让上层处理
-        
-        logger.info(f"Using {len(valid_weights)}/{len(client_weight_datas)} client weights for aggregation")
-        return valid_weights
-
     def federated_average(self, client_weight_datas):
-        # 验证客户端权重
-        valid_client_weights = self._validate_client_weights(client_weight_datas)
+        """Federated averaging with support for real quantization."""
+        # Validate and process client weights
+        valid_client_weights = self._validate_and_process_client_weights(client_weight_datas)
         client_num = len(valid_client_weights)
-        
+
         if client_num == 0:
             logger.error("No valid client weights for aggregation!")
             return self.s_model.state_dict()
 
+        logger.info(f"Server: Starting federated aggregation with {client_num} clients...")
+
+        # 🔧 Handle aggregation of quantized weights
+        if self._has_quantized_weights(valid_client_weights):
+            logger.info("Server: Detected quantized weights from clients, dequantizing for aggregation...")
+            dequantized_weights = []
+            for i, weights in enumerate(valid_client_weights):
+                if self._is_quantized_weights(weights):
+                    deq_weights = dequantize_state_dict_real(weights)
+                    dequantized_weights.append(deq_weights)
+                    logger.info(f"Server: Dequantized weights from client {i}")
+                else:
+                    dequantized_weights.append(weights)
+            valid_client_weights = dequantized_weights
+
+        # Perform standard federated averaging
+        aggregated_w = self._perform_federated_averaging(valid_client_weights)
+
+        # Apply server-side noise if needed
+        final_w = self._apply_server_noise(aggregated_w)
+
+        # 🔧 Server-side quantization (if enabled)
+        if (self.quantization_enabled and
+                hasattr(self.training_args, 'quantize_global_model') and
+                self.training_args.quantize_global_model and
+                QUANTIZATION_AVAILABLE):
+
+            logger.info("Server: Applying quantization to global model...")
+            quantized_global, global_stats = quantize_state_dict_real(
+                final_w,
+                type('Config', (), {'apply_quantization': True})()
+            )
+
+            logger.info("Server: Global model quantization results:")
+            logger.info(f"   📊 Compression: {global_stats['compression_ratio']:.2f}x")
+            logger.info(
+                f"   💾 Size: {global_stats['original_size_mb']:.2f}MB -> {global_stats['quantized_size_mb']:.2f}MB")
+
+            self.s_model.load_state_dict(dequantize_state_dict_real(quantized_global))
+            return final_w
+        else:
+            # Standard case: load and return weights
+            try:
+                self.s_model.load_state_dict(final_w, strict=True)
+                logger.info("Server: Model weights updated successfully")
+            except RuntimeError as e:
+                logger.error(f"Failed to load state_dict: {e}")
+                self.s_model.load_state_dict(final_w, strict=False)
+
+        return final_w
+
+    def _validate_and_process_client_weights(self, client_weight_datas):
+        """Validate and process client weights."""
+        valid_weights = []
+        for i, weights in enumerate(client_weight_datas):
+            if self._is_quantized_weights(weights):
+                if self._validate_quantized_weights(weights):
+                    valid_weights.append(weights)
+                else:
+                    logger.warning(f"Client {i} quantized weights are invalid, excluding from aggregation")
+            else:
+                is_valid = True
+                for key, param in weights.items():
+                    if torch.isnan(param).any() or torch.isinf(param).any():
+                        logger.warning(f"Client {i} weights contain NaN/Inf in {key}, excluding from aggregation")
+                        is_valid = False
+                        break
+                if is_valid:
+                    valid_weights.append(weights)
+
+        if len(valid_weights) == 0:
+            logger.error("No valid client weights for aggregation!")
+            return client_weight_datas
+
+        logger.info(f"Using {len(valid_weights)}/{len(client_weight_datas)} client weights for aggregation")
+        return valid_weights
+
+    def _has_quantized_weights(self, client_weights_list):
+        """Check if any weights are quantized."""
+        return any(self._is_quantized_weights(weights) for weights in client_weights_list)
+
+    def _is_quantized_weights(self, weights):
+        """Check if a set of weights is quantized."""
+        if not isinstance(weights, dict):
+            return False
+        return any(isinstance(v, dict) and v.get('quantized', False) for v in weights.values())
+
+    def _validate_quantized_weights(self, quantized_weights):
+        """Validate the integrity of quantized weights."""
+        try:
+            for key, value in quantized_weights.items():
+                if isinstance(value, dict) and value.get('quantized', False):
+                    if 'data' not in value or 'scale' not in value or 'zero_point' not in value:
+                        return False
+                    if torch.isnan(torch.tensor(value['scale'])) or torch.isinf(torch.tensor(value['scale'])):
+                        return False
+            return True
+        except:
+            return False
+
+    def _perform_federated_averaging(self, valid_client_weights):
+        """Perform federated averaging."""
+        client_num = len(valid_client_weights)
         first_client_w = valid_client_weights[0]
         aggregated_w = OrderedDict()
 
-        logger.info(f"Server: Starting federated aggregation with {client_num} clients...")
-        
         for key in first_client_w.keys():
             param_template = first_client_w[key]
 
             if param_template.is_floating_point():
-                # 聚合浮点张量（权重、偏置等）
                 sum_param = torch.zeros_like(param_template)
                 valid_param_count = 0
-                
+
                 for i in range(client_num):
                     client_param = valid_client_weights[i][key]
-                    
-                    # 再次检查参数有效性
                     if not (torch.isnan(client_param).any() or torch.isinf(client_param).any()):
                         sum_param += client_param.to(sum_param.device)
                         valid_param_count += 1
@@ -438,46 +521,24 @@ class Server():
                 if valid_param_count > 0:
                     aggregated_w[key] = sum_param / valid_param_count
                 else:
-                    # 如果所有客户端的这个参数都无效，保持服务器的原始参数
                     logger.warning(f"All client weights for {key} are invalid, keeping server weight")
                     aggregated_w[key] = self.s_model.state_dict()[key].clone()
             else:
-                # 对于非浮点张量，使用第一个有效客户端的值
                 aggregated_w[key] = param_template.clone()
 
-        # 检查聚合后的权重
-        for key, param in aggregated_w.items():
-            if torch.isnan(param).any() or torch.isinf(param).any():
-                logger.error(f"Aggregated weight {key} contains NaN/Inf! Using server's original weight.")
-                aggregated_w[key] = self.s_model.state_dict()[key].clone()
+        return aggregated_w
 
-        # 添加服务器端后处理噪声（减少噪声强度以提高稳定性）
-        final_w = aggregated_w
-
-        if hasattr(self.training_args, 'global_noise_type') and \
-                self.training_args.global_noise_type.lower() == 'laplace' and \
-                hasattr(self.training_args, 'global_noise_scale') and \
-                self.training_args.global_noise_scale > 0:
-            # 减少噪声强度以提高稳定性
+    def _apply_server_noise(self, aggregated_w):
+        """Apply server-side noise."""
+        if (hasattr(self.training_args, 'global_noise_type') and
+                self.training_args.global_noise_type.lower() == 'laplace' and
+                hasattr(self.training_args, 'global_noise_scale') and
+                self.training_args.global_noise_scale > 0):
             reduced_noise_scale = min(self.training_args.global_noise_scale, 0.01)
             final_w = add_laplacian_noise_to_state_dict(aggregated_w, reduced_noise_scale)
             logger.info(f"Applied reduced noise scale: {reduced_noise_scale}")
-
-        # 加载最终权重到服务器模型
-        try:
-            self.s_model.load_state_dict(final_w, strict=True)
-            logger.info("Server: Model weights updated successfully")
-        except RuntimeError as e:
-            logger.error(f"Failed to load state_dict with strict=True: {e}")
-            try:
-                self.s_model.load_state_dict(final_w, strict=False)
-                logger.warning("Loaded state_dict with strict=False")
-            except Exception as e2:
-                logger.error(f"Failed to load state_dict even with strict=False: {e2}")
-                logger.error("Model state may be corrupted!")
-
-        logger.info("Server: Federated aggregation and model update complete.")
-        return final_w
+            return final_w
+        return aggregated_w
 
     def compute_metrics(self, eval_pred):
         logits_, labels = eval_pred
@@ -487,27 +548,24 @@ class Server():
         return {"accuracy": accuracy}
 
     def _check_accuracy_drop(self, current_accuracy):
-        """检查准确率是否异常下降"""
+        """Checks for abnormal drops in accuracy."""
         self.accuracy_history.append(current_accuracy)
-        
+
         if len(self.accuracy_history) >= 3:
-            # 检查最近3轮的准确率趋势
             recent_accuracies = self.accuracy_history[-3:]
-            if all(acc < 0.6 for acc in recent_accuracies):  # 连续3轮低于60%
-                logger.warning("🚨 Accuracy consistently low! Possible training instability.")
+            if all(acc < self.min_accuracy_threshold for acc in recent_accuracies):
+                logger.warning(f"🚨 Accuracy consistently below {self.min_accuracy_threshold}! Possible training instability.")
                 return True
-                
-            # 检查是否有急剧下降
             if len(self.accuracy_history) >= 2:
                 prev_acc = self.accuracy_history[-2]
                 if prev_acc - current_accuracy > self.accuracy_drop_threshold:
                     logger.warning(f"🚨 Significant accuracy drop: {prev_acc:.4f} -> {current_accuracy:.4f}")
                     return True
-        
+
         return False
 
     def evalute(self):
-        # 在评估前检查模型权重是否正常
+        # Check if model weights are normal before evaluation
         model_param_norms = []
         for name, param in self.s_model.named_parameters():
             if param.requires_grad:
@@ -515,7 +573,7 @@ class Server():
                 model_param_norms.append(param_norm)
                 if torch.isnan(param).any() or torch.isinf(param).any():
                     logger.error(f"Global model parameter {name} contains NaN/Inf!")
-                    
+
         avg_norm = np.mean(model_param_norms) if model_param_norms else 0
         logger.info(f"Global model average parameter norm: {avg_norm:.4f}")
 
@@ -528,17 +586,15 @@ class Server():
             data_collator=self.data_collator,
             compute_metrics=self.compute_metrics,
         )
-        
+
         try:
             results = distill_trainer.evaluate(eval_dataset=self.dataset)
             current_accuracy = results['eval_accuracy']
-            
-            # 检查准确率异常下降
+
             accuracy_drop_detected = self._check_accuracy_drop(current_accuracy)
             if accuracy_drop_detected:
                 logger.warning("Consider reducing learning rate or target sparsity")
-            
-            # 记录量化相关信息（如果启用）
+
             if self.quantization_enabled and QUANTIZATION_AVAILABLE:
                 try:
                     current_size_info = get_model_size_info(self.s_model)
@@ -546,79 +602,217 @@ class Server():
                     logger.info(f"Global model size: {current_size_info['model_size_mb']:.2f}MB")
                 except Exception as e:
                     logger.warning(f"Could not get current model size: {e}")
-            
+
             if results['eval_accuracy'] > self.best_result and results['sparsity'] < 0.11:
                 self.best_result = results['eval_accuracy']
-            
+
             logger.info(f"Evaluation results: {results}")
             logger.info(f"Best results: {self.best_result}")
-            
+
         except Exception as e:
             logger.error(f"Evaluation failed: {e}")
-            # 如果评估失败，尝试简单的准确率计算
             try:
                 self._simple_accuracy_check()
             except:
                 logger.error("Even simple accuracy check failed!")
 
     def _simple_accuracy_check(self):
-        """简单的准确率检查，用于评估失败时的备用方案"""
+        """A simple accuracy check as a fallback for evaluation failures."""
         logger.info("Running simple accuracy check...")
         self.s_model.eval()
         correct = 0
         total = 0
-        
+
         with torch.no_grad():
             for i, sample in enumerate(self.dataset):
-                if i >= 100:  # 只检查100个样本
+                if i >= 100:
                     break
                 try:
                     inputs = self.tokenizer(sample['sentence'], return_tensors='pt', truncation=True, max_length=256)
                     inputs = {k: v.to(next(self.s_model.parameters()).device) for k, v in inputs.items()}
                     outputs = self.s_model(**inputs)
-                    
+
                     if torch.isnan(outputs.logits).any():
                         logger.warning(f"Model output contains NaN for sample {i}")
                         continue
-                        
+
                     prediction = torch.argmax(outputs.logits, dim=-1).item()
                     correct += (prediction == sample['label'])
                     total += 1
                 except Exception as e:
                     logger.warning(f"Error processing sample {i}: {e}")
                     continue
-        
+
         simple_accuracy = correct / total if total > 0 else 0
         logger.info(f"Simple accuracy check: {simple_accuracy:.4f} ({correct}/{total})")
 
+    def adaptive_sparsity_scheduling(self, current_epoch, current_accuracy):
+        """
+        🔧 修复8: 完全重写稀疏度调度逻辑，解决原来的反向逻辑问题
+        原问题：代码在减少稀疏度而非增加
+        修正：正确实现从低稀疏度到高稀疏度的渐进剪枝
+        """
+        # 获取当前稀疏度目标
+        current_target_sparsity = self.client.distill_args.target_sparsity
+        
+        # 🔧 核心修复：正确的稀疏度增长逻辑
+        # 基于epoch的基础调度
+        if self.sparsity_schedule == 'gradual':
+            # 线性增长：从initial_target_sparsity到final_target_sparsity
+            progress = min(current_epoch / (self.epochs * 0.8), 1.0)  # 在80%的训练时间内完成剪枝
+            base_target_sparsity = self.initial_target_sparsity + progress * (
+                self.final_target_sparsity - self.initial_target_sparsity
+            )
+        elif self.sparsity_schedule == 'aggressive':
+            # 更激进的调度
+            progress = min(current_epoch / (self.epochs * 0.6), 1.0)  # 在60%的训练时间内完成剪枝
+            base_target_sparsity = self.initial_target_sparsity + progress * (
+                self.final_target_sparsity - self.initial_target_sparsity
+            )
+        else:
+            # 固定稀疏度
+            base_target_sparsity = self.final_target_sparsity
+
+        # 🔧 自适应调整：基于准确率变化
+        new_target_sparsity = base_target_sparsity
+        
+        if len(self.accuracy_history) >= 2:
+            recent_acc = self.accuracy_history[-1]
+            prev_acc = self.accuracy_history[-2]
+            
+            if recent_acc < prev_acc:
+                # 准确率下降，减缓剪枝速度
+                self.consecutive_drops += 1
+                logger.warning(
+                    f"📉 Accuracy dropped: {prev_acc:.4f} → {recent_acc:.4f} (consecutive drops: {self.consecutive_drops})")
+                
+                if self.consecutive_drops >= self.sparsity_patience:
+                    # 多次连续下降，显著减缓剪枝
+                    sparsity_increase = base_target_sparsity - current_target_sparsity
+                    adjusted_increase = sparsity_increase * self.sparsity_adjustment_factor
+                    new_target_sparsity = current_target_sparsity + adjusted_increase
+                    
+                    logger.warning(f"🚨 Slowing down pruning due to {self.consecutive_drops} consecutive accuracy drops")
+                    logger.info(f"🔧 Reduced sparsity increase: {sparsity_increase:.4f} → {adjusted_increase:.4f}")
+                else:
+                    # 单次下降，轻微减缓
+                    sparsity_increase = base_target_sparsity - current_target_sparsity
+                    adjusted_increase = sparsity_increase * 0.7  # 减少30%的增长
+                    new_target_sparsity = current_target_sparsity + adjusted_increase
+            else:
+                # 准确率稳定或上升，正常调度
+                self.consecutive_drops = 0
+                new_target_sparsity = base_target_sparsity
+        
+        # 🔧 关键修复：确保稀疏度单调递增且有界
+        # 1. 不能低于当前稀疏度（单调递增）
+        new_target_sparsity = max(new_target_sparsity, current_target_sparsity)
+        
+        # 2. 限制每轮的最大增长
+        max_allowed_sparsity = current_target_sparsity + self.max_sparsity_increase_per_epoch
+        new_target_sparsity = min(new_target_sparsity, max_allowed_sparsity)
+        
+        # 3. 不能超过最终目标
+        new_target_sparsity = min(new_target_sparsity, self.final_target_sparsity)
+        
+        # 4. 确保在合理范围内
+        new_target_sparsity = max(new_target_sparsity, 0.0)
+        new_target_sparsity = min(new_target_sparsity, 0.95)  # 最多剪枝95%
+        
+        # 🔧 应用新的稀疏度目标
+        if abs(new_target_sparsity - current_target_sparsity) > 0.001:  # 避免无意义的微小更新
+            sparsity_increase = new_target_sparsity - current_target_sparsity
+            progress_percentage = (new_target_sparsity - self.initial_target_sparsity) / (
+                self.final_target_sparsity - self.initial_target_sparsity) * 100
+            
+            logger.info(f"🎯 Sparsity update: {current_target_sparsity:.4f} → {new_target_sparsity:.4f} "
+                       f"(+{sparsity_increase:.4f})")
+            logger.info(f"📊 Pruning progress: {progress_percentage:.1f}% toward final target")
+            
+            # 更新客户端的目标稀疏度
+            self.client.distill_args.target_sparsity = new_target_sparsity
+            
+            # 🔧 新增：直接更新模型掩码
+            try:
+                # 创建一个临时trainer来访问掩码更新方法
+                temp_trainer = DistillTrainer(
+                    self.s_model,
+                    self.t_model,
+                    args=self.distill_args,
+                    eval_dataset=self.dataset,
+                    tokenizer=self.tokenizer,
+                    data_collator=self.data_collator,
+                    compute_metrics=self.compute_metrics,
+                )
+                temp_trainer.update_masks_for_target_sparsity(new_target_sparsity)
+                logger.info("✅ Updated model masks with new target sparsity")
+            except Exception as e:
+                logger.warning(f"Failed to update masks directly: {e}")
+        
+        return new_target_sparsity
+
     def run(self):
+        """
+        🔧 修复9: 改进的训练主循环，正确的剪枝进度控制
+        """
         logger.info(f"Starting federated learning with {self.epochs} epochs")
-        if self.quantization_enabled:
-            logger.info("Quantization simulation enabled")
+        logger.info(f"🎯 Pruning schedule: {self.initial_target_sparsity:.1f} → {self.final_target_sparsity:.1f}")
+        logger.info(f"📈 Strategy: {self.sparsity_schedule}, Max increase/epoch: {self.max_sparsity_increase_per_epoch:.2f}")
+        
+        # 设置初始稀疏度
+        self.client.distill_args.target_sparsity = self.initial_target_sparsity
         
         for epoch in range(self.epochs):
-            logger.info(f"=== Epoch: {epoch} ===")
+            logger.info(f"=== Epoch: {epoch+1}/{self.epochs} ===")
+            
+            # 显示当前剪枝状态
+            current_target = self.client.distill_args.target_sparsity
+            progress = (current_target - self.initial_target_sparsity) / (
+                self.final_target_sparsity - self.initial_target_sparsity) * 100
+            logger.info(f"🎯 Current target sparsity: {current_target:.4f} ({current_target*100:.1f}%)")
+            logger.info(f"📊 Pruning progress: {progress:.1f}%")
+
+            # 执行联邦训练
             client_ids = [i for i in range(self.num_clients)]
             client_weight_datas = self.distribute_task(client_ids)
             self.federated_average(client_weight_datas)
+
+            # 评估模型
             self.evalute()
-            
-            # 根据准确率动态调整稀疏度，更保守的策略
-            current_sparsity = self.client.distill_args.target_sparsity
-            
-            # 如果准确率历史记录显示下降趋势，减缓稀疏度增加
-            if len(self.accuracy_history) >= 2 and self.accuracy_history[-1] < self.accuracy_history[-2]:
-                sparsity_reduction = 0.05  # 更小的调整步长
-                logger.info(f"Accuracy decreased, using smaller sparsity adjustment: {sparsity_reduction}")
-            else:
-                sparsity_reduction = 0.1  # 标准调整步长
-            
-            new_sparsity = max(0.1, current_sparsity - sparsity_reduction)
-            self.client.distill_args.target_sparsity = new_sparsity
-            
-            logger.info(f"Updated target sparsity: {current_sparsity:.2f} -> {new_sparsity:.2f}")
-            
-            # 如果准确率持续很低，提前停止训练
-            if len(self.accuracy_history) >= 5 and all(acc < 0.55 for acc in self.accuracy_history[-5:]):
-                logger.warning("🚨 Accuracy consistently very low for 5 epochs. Consider stopping training.")
-                logger.warning("Suggestions: 1) Reduce learning rate 2) Reduce target sparsity 3) Check data quality")
+
+            # 🔧 使用修复后的自适应稀疏度调度
+            current_accuracy = self.accuracy_history[-1] if self.accuracy_history else 0.0
+            new_sparsity = self.adaptive_sparsity_scheduling(epoch, current_accuracy)
+
+            # 早停检查（准确率持续过低）
+            if len(self.accuracy_history) >= 5:
+                recent_accuracies = self.accuracy_history[-5:]
+                if all(acc < self.min_accuracy_threshold for acc in recent_accuracies):
+                    logger.error(f"🛑 Training stopped: Accuracy below {self.min_accuracy_threshold} for 5 consecutive epochs")
+                    logger.error("🔧 Recommendations:")
+                    logger.error(f"   1. Reduce final target sparsity (current: {self.final_target_sparsity})")
+                    logger.error(f"   2. Use more gradual sparsity schedule")
+                    logger.error(f"   3. Increase sparsity patience (current: {self.sparsity_patience})")
+                    logger.error(f"   4. Reduce max sparsity increase per epoch (current: {self.max_sparsity_increase_per_epoch})")
+                    break
+
+            # 检查是否达到最终目标
+            if abs(new_sparsity - self.final_target_sparsity) < 0.01:
+                logger.info(f"🎉 Reached target sparsity: {new_sparsity:.4f}")
+                
+            logger.info("=" * 50)
+
+        # 训练完成总结
+        logger.info("🎉 FEDERATED LEARNING COMPLETED")
+        if hasattr(self, 'accuracy_history') and self.accuracy_history:
+            final_acc = self.accuracy_history[-1]
+            best_acc = max(self.accuracy_history)
+            logger.info(f"📊 Final accuracy: {final_acc:.4f}")
+            logger.info(f"📊 Best accuracy: {best_acc:.4f}")
+        
+        final_sparsity = self.client.distill_args.target_sparsity
+        achieved_progress = (final_sparsity - self.initial_target_sparsity) / (
+            self.final_target_sparsity - self.initial_target_sparsity) * 100
+        logger.info(f"🎯 Final target sparsity: {final_sparsity:.4f}")
+        logger.info(f"📈 Pruning progress achieved: {achieved_progress:.1f}%")
+        logger.info("=" * 50)
