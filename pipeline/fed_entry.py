@@ -34,6 +34,11 @@ except ImportError as e:
     DP_AVAILABLE = False
     logging.warning(f"❌ DP import failed: {e}")
     logging.warning("Differential Privacy features disabled.")
+    logging.warning("To enable DP, ensure dp_core.py is available in the same directory.")
+except Exception as e:
+    DP_AVAILABLE = False
+    logging.error(f"❌ DP module error: {e}")
+    logging.error("Differential Privacy features disabled due to module error.")
 
 try:
     from .quantization_utils import (
@@ -98,9 +103,7 @@ def add_laplacian_noise_to_state_dict(state_dict, noise_scale_b):
 
             noisy_state_dict[key] = param_tensor + noise_tensor
         else:
-            noisy_state_dict[key] = param_tensor.clone(
-
-            )
+            noisy_state_dict[key] = param_tensor.clone()
     return noisy_state_dict
 
 
@@ -134,7 +137,12 @@ class Client():
 
         # ========== DP初始化 ==========
         self.dp_trainer = None
-        if DP_AVAILABLE and hasattr(training_args, 'apply_dp') and training_args.apply_dp:
+        if hasattr(training_args, 'apply_dp') and training_args.apply_dp:
+            if not DP_AVAILABLE:
+                error_msg = "DP requested but dp_core module not available. Please ensure dp_core.py is in the pipeline directory."
+                logger.error(f"❌ {error_msg}")
+                raise ImportError(error_msg)
+
             try:
                 logger.info("🔒 Initializing Differential Privacy for client...")
                 # DP将在Server中统一管理，这里只是标记
@@ -211,36 +219,57 @@ class Client():
 
     def _create_client_trainer(self, server_model, t_model, client_id):
         """为客户端创建训练器实例"""
-        # 创建训练参数副本
-        client_train_args = deepcopy(self.distill_args)
-        client_train_args.output_dir = f"./client_{client_id}_output"
+        try:
+            # 创建训练参数副本
+            client_train_args = deepcopy(self.distill_args)
+            client_train_args.output_dir = f"./client_{client_id}_output"
 
-        # 获取客户端数据集
-        train_dataset = self.client_train_datas[client_id]
-        eval_dataset = self.dataset.get('validation', None)
+            # 获取客户端数据集
+            train_dataset = self.client_train_datas[client_id]
+            eval_dataset = self.dataset.get('validation', None)
 
-        # 创建训练器
-        trainer = DistillTrainer(
-            server_model,
-            t_model,
-            args=client_train_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            tokenizer=self.tokenizer,
-            data_collator=self.data_collator,
-            compute_metrics=self.compute_metrics,
-        )
+            # 确保模型处于正确状态
+            server_model.train()
 
-        return trainer
+            # 创建训练器
+            trainer = DistillTrainer(
+                server_model,
+                t_model,
+                args=client_train_args,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                tokenizer=self.tokenizer,
+                data_collator=self.data_collator,
+                compute_metrics=self.compute_metrics,
+            )
+
+            logger.info(f"✅ Client {client_id}: Trainer created successfully")
+            return trainer
+
+        except Exception as e:
+            logger.error(f"❌ Client {client_id}: Failed to create trainer: {e}")
+            logger.exception("Full trainer creation error:")
+            return None
 
     def _create_fallback_update(self, server_weights):
         """创建后备更新（当训练失败时）"""
-        if self.dp_enabled:
-            # DP模式：返回零增量
-            return {key: torch.zeros_like(tensor) for key, tensor in server_weights.items()}
-        else:
-            # 非DP模式：返回原权重
-            return server_weights
+        try:
+            if self.dp_enabled:
+                # DP模式：返回零增量
+                logger.info("Creating zero update for DP fallback")
+                return {key: torch.zeros_like(tensor) for key, tensor in server_weights.items()}
+            else:
+                # 非DP模式：返回原权重
+                logger.info("Returning original weights for non-DP fallback")
+                return deepcopy(server_weights)
+        except Exception as e:
+            logger.error(f"Failed to create fallback update: {e}")
+            # 最后的安全回退
+            if isinstance(server_weights, dict):
+                return {key: torch.zeros_like(tensor) if torch.is_tensor(tensor) else tensor
+                        for key, tensor in server_weights.items()}
+            else:
+                return server_weights
 
     def _apply_quantization_simulation(self, server_model, client_id, datasets):
         """Performs safe quantization simulation for analysis only, without affecting training."""
@@ -274,9 +303,34 @@ class Client():
             try:
                 logger.info(f"🔒 Client {client_id}: Starting DP training")
 
+                # 先加载服务器权重到模型
+                try:
+                    if (isinstance(server_weights, dict) and QUANTIZATION_AVAILABLE and
+                            any(isinstance(v, dict) and v.get('quantized', False) for v in server_weights.values())):
+                        logger.info(f"Client {client_id}: Dequantizing received weights...")
+                        server_weights = dequantize_state_dict_real(server_weights)
+
+                    server_model.load_state_dict(server_weights, strict=True)
+                    logger.info(f"✅ Client {client_id}: Server weights loaded successfully")
+                except Exception as e:
+                    logger.warning(f"⚠️  Client {client_id}: Failed to load weights strictly: {e}")
+                    try:
+                        server_model.load_state_dict(server_weights, strict=False)
+                        logger.info(f"✅ Client {client_id}: Server weights loaded with strict=False")
+                    except Exception as e2:
+                        logger.error(f"❌ Client {client_id}: Failed to load weights at all: {e2}")
+                        return self._create_fallback_update(server_weights)
+
+                # 创建客户端训练器
+                client_trainer = self._create_client_trainer(server_model, t_model, client_id)
+
+                if client_trainer is None:
+                    logger.error(f"❌ Client {client_id}: Failed to create trainer, falling back to non-DP training")
+                    return self._original_train_epoch(server_model, client_id, server_weights, t_model, datasets)
+
                 # 使用DP训练步骤
                 clipped_update = self.dp_trainer.client_training_step(
-                    client_trainer=None,  # 将在方法内部创建
+                    client_trainer=client_trainer,
                     server_weights=server_weights,
                     client_train_data=datasets,
                     client_id=client_id,
@@ -289,7 +343,9 @@ class Client():
 
             except Exception as e:
                 logger.error(f"❌ Client {client_id}: DP training failed: {e}")
-                return self._create_fallback_update(server_weights)
+                logger.exception("Full DP training error traceback:")
+                logger.info(f"🔄 Client {client_id}: Falling back to standard training")
+                return self._original_train_epoch(server_model, client_id, server_weights, t_model, datasets)
 
         else:
             # ========== 非DP模式：原有训练逻辑 ==========
@@ -415,12 +471,25 @@ class Server():
 
         # ========== DP初始化 ==========
         self.dp_trainer = None
-        if DP_AVAILABLE and hasattr(training_args, 'apply_dp') and training_args.apply_dp:
+        if hasattr(training_args, 'apply_dp') and training_args.apply_dp:
+            if not DP_AVAILABLE:
+                error_msg = "DP requested but dp_core module not available. Please ensure dp_core.py is in the pipeline directory."
+                logger.error(f"❌ {error_msg}")
+                if hasattr(training_args, 'dp_strict_mode') and training_args.dp_strict_mode:
+                    raise ImportError(error_msg)
+                else:
+                    logger.warning("⚠️  Continuing without DP protection (non-strict mode)")
+                    return
+
             try:
                 logger.info("🔒 Initializing Differential Privacy for server...")
 
                 # 创建DP训练器
                 self.dp_trainer = create_dp_federated_trainer(training_args)
+
+                if self.dp_trainer is None:
+                    logger.error("❌ Failed to create DP trainer")
+                    raise ValueError("DP trainer creation failed")
 
                 # 将DP训练器传递给客户端
                 self.client.set_dp_trainer(self.dp_trainer)
@@ -431,9 +500,26 @@ class Server():
                 logger.info(f"   ✂️  Clipping bound: {training_args.dp_clipping_bound}")
                 logger.info(f"   📊 Accountant: {training_args.dp_accountant_type}")
 
+                # 验证DP trainer组件
+                if not hasattr(self.dp_trainer, 'dp_manager'):
+                    logger.error("❌ DP trainer missing dp_manager")
+                    raise ValueError("Invalid DP trainer structure")
+
+                if not hasattr(self.dp_trainer, 'client_training_step'):
+                    logger.error("❌ DP trainer missing client_training_step method")
+                    raise ValueError("Invalid DP trainer methods")
+
+                logger.info("✅ DP trainer validation passed")
+
             except Exception as e:
                 logger.error(f"❌ DP initialization failed: {e}")
+                logger.exception("Full DP initialization error:")
                 self.dp_trainer = None
+                # 可以选择是否要抛出异常或继续运行
+                if hasattr(training_args, 'dp_strict_mode') and training_args.dp_strict_mode:
+                    raise RuntimeError(f"DP initialization failed in strict mode: {e}")
+                else:
+                    logger.warning("⚠️  Continuing without DP protection")
         else:
             logger.info("ℹ️  Standard federated learning (no DP)")
 
