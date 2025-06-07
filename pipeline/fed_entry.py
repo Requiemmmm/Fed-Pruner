@@ -1,33 +1,39 @@
-import os
-import sys
-import random
 import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
 import logging
-import transformers
+from collections import OrderedDict
+from typing import Union
+
+import numpy as np
+import torch
+from datasets import load_from_disk
+from transformers import AutoTokenizer
 from transformers import (
     HfArgumentParser,
     DataCollatorWithPadding
 )
-from transformers import AutoTokenizer, AutoConfig
+from transformers import Trainer
 from transformers.models.bert.modeling_bert import BertForSequenceClassification as TModel
 
 from modeling.modeling_cofi_bert import CoFiBertForSequenceClassification as SModel
-
-from datasets import DatasetDict, Dataset, load_from_disk, load_metric, load_dataset
-from typing import Optional, Dict, List, Tuple, Callable, Union
-from copy import deepcopy
-from transformers import Trainer
-import logging
-from collections import OrderedDict
-
-from .trainer import DistillTrainer
 from .args import (
     TrainingArguments,
     ModelArguments,
 )
+from .trainer import DistillTrainer
+
+# ========== DP模块导入 ==========
+try:
+    from .dp_core import (
+        DPConfig, DifferentialPrivacyManager,
+        FederatedDPTraining, create_dp_federated_trainer
+    )
+
+    DP_AVAILABLE = True
+    logging.info("✅ Differential Privacy modules loaded successfully!")
+except ImportError as e:
+    DP_AVAILABLE = False
+    logging.warning(f"❌ DP import failed: {e}")
+    logging.warning("Differential Privacy features disabled.")
 
 try:
     from .quantization_utils import (
@@ -92,7 +98,9 @@ def add_laplacian_noise_to_state_dict(state_dict, noise_scale_b):
 
             noisy_state_dict[key] = param_tensor + noise_tensor
         else:
-            noisy_state_dict[key] = param_tensor.clone()
+            noisy_state_dict[key] = param_tensor.clone(
+
+            )
     return noisy_state_dict
 
 
@@ -118,10 +126,26 @@ class Client():
         self.dataset = dataset
         self.half = training_args.half
         self.client_train_datas = self.load_client_train_datas()
+        self.training_args = training_args  # 保存training_args引用
 
         self.distill_args = get_distill_args(training_args)
         self.distill_args.num_train_epochs = 1
         self.distill_args.gradient_accumulation_steps = 4
+
+        # ========== DP初始化 ==========
+        self.dp_trainer = None
+        if DP_AVAILABLE and hasattr(training_args, 'apply_dp') and training_args.apply_dp:
+            try:
+                logger.info("🔒 Initializing Differential Privacy for client...")
+                # DP将在Server中统一管理，这里只是标记
+                self.dp_enabled = True
+                logger.info("✅ Client DP mode enabled")
+            except Exception as e:
+                logger.error(f"❌ Client DP initialization failed: {e}")
+                self.dp_enabled = False
+        else:
+            self.dp_enabled = False
+            logger.info("ℹ️  Client DP mode disabled")
 
         # Initialize quantization config
         self.quantization_config = None
@@ -140,6 +164,11 @@ class Client():
             except Exception as e:
                 logger.warning(f"Quantization initialization failed: {e}")
                 self.quantization_config = None
+
+    def set_dp_trainer(self, dp_trainer):
+        """设置DP训练器（由Server调用）"""
+        self.dp_trainer = dp_trainer
+        logger.info("🔒 DP trainer set for client")
 
     def load_client_train_datas(self):
         client_train_datas = []
@@ -180,6 +209,39 @@ class Client():
                 safe_state_dict[key] = param.detach().clone()
         return safe_state_dict
 
+    def _create_client_trainer(self, server_model, t_model, client_id):
+        """为客户端创建训练器实例"""
+        # 创建训练参数副本
+        client_train_args = deepcopy(self.distill_args)
+        client_train_args.output_dir = f"./client_{client_id}_output"
+
+        # 获取客户端数据集
+        train_dataset = self.client_train_datas[client_id]
+        eval_dataset = self.dataset.get('validation', None)
+
+        # 创建训练器
+        trainer = DistillTrainer(
+            server_model,
+            t_model,
+            args=client_train_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=self.tokenizer,
+            data_collator=self.data_collator,
+            compute_metrics=self.compute_metrics,
+        )
+
+        return trainer
+
+    def _create_fallback_update(self, server_weights):
+        """创建后备更新（当训练失败时）"""
+        if self.dp_enabled:
+            # DP模式：返回零增量
+            return {key: torch.zeros_like(tensor) for key, tensor in server_weights.items()}
+        else:
+            # 非DP模式：返回原权重
+            return server_weights
+
     def _apply_quantization_simulation(self, server_model, client_id, datasets):
         """Performs safe quantization simulation for analysis only, without affecting training."""
         if not self.quantization_config or not self.quantization_config.apply_quantization:
@@ -202,8 +264,39 @@ class Client():
             logger.warning(f"Client {client_id}: Quantization simulation failed: {e}")
 
     def train_epoch(self, server_model, client_id, server_weights, t_model):
-        """A training epoch with real quantization."""
+        """
+        ========== 修改后的训练方法，支持DP ==========
+        """
         datasets = self.client_train_datas[client_id]
+
+        if self.dp_enabled and self.dp_trainer:
+            # ========== DP模式：使用完整的DP训练流程 ==========
+            try:
+                logger.info(f"🔒 Client {client_id}: Starting DP training")
+
+                # 使用DP训练步骤
+                clipped_update = self.dp_trainer.client_training_step(
+                    client_trainer=None,  # 将在方法内部创建
+                    server_weights=server_weights,
+                    client_train_data=datasets,
+                    client_id=client_id,
+                    training_args=self.training_args,
+                    teacher_model=t_model
+                )
+
+                logger.info(f"🔒 Client {client_id}: DP training completed, returning clipped update")
+                return clipped_update
+
+            except Exception as e:
+                logger.error(f"❌ Client {client_id}: DP training failed: {e}")
+                return self._create_fallback_update(server_weights)
+
+        else:
+            # ========== 非DP模式：原有训练逻辑 ==========
+            return self._original_train_epoch(server_model, client_id, server_weights, t_model, datasets)
+
+    def _original_train_epoch(self, server_model, client_id, server_weights, t_model, datasets):
+        """原有的训练逻辑"""
 
         # Safely load weights
         try:
@@ -320,6 +413,30 @@ class Server():
         self.epochs = epochs
         self.distill = training_args.distill
 
+        # ========== DP初始化 ==========
+        self.dp_trainer = None
+        if DP_AVAILABLE and hasattr(training_args, 'apply_dp') and training_args.apply_dp:
+            try:
+                logger.info("🔒 Initializing Differential Privacy for server...")
+
+                # 创建DP训练器
+                self.dp_trainer = create_dp_federated_trainer(training_args)
+
+                # 将DP训练器传递给客户端
+                self.client.set_dp_trainer(self.dp_trainer)
+
+                logger.info(f"✅ DP-FedAvg enabled:")
+                logger.info(f"   🎯 Target ε: {training_args.dp_target_epsilon}")
+                logger.info(f"   🔊 Noise multiplier: {training_args.dp_noise_multiplier}")
+                logger.info(f"   ✂️  Clipping bound: {training_args.dp_clipping_bound}")
+                logger.info(f"   📊 Accountant: {training_args.dp_accountant_type}")
+
+            except Exception as e:
+                logger.error(f"❌ DP initialization failed: {e}")
+                self.dp_trainer = None
+        else:
+            logger.info("ℹ️  Standard federated learning (no DP)")
+
         if self.distill == True:
             self.t_model = TModel.from_pretrained('./[glue]/sst2-half-datas')
             self.s_model = SModel.from_pretrained('./[glue]/sst2-half-datas')
@@ -365,32 +482,129 @@ class Server():
         # 🔧 修复7: 正确的剪枝调度策略
         # 原问题：稀疏度策略逻辑反向，在减少而非增加稀疏度
         self.initial_target_sparsity = 0.1  # 起始稀疏度：10%
-        self.final_target_sparsity = 0.8    # 最终稀疏度：80%
-        self.sparsity_schedule = 'gradual'   # 调度策略：渐进式
-        self.sparsity_patience = 3          # 稀疏度调整的耐心值
-        self.consecutive_drops = 0          # 连续下降次数
-        
+        self.final_target_sparsity = 0.8  # 最终稀疏度：80%
+        self.sparsity_schedule = 'gradual'  # 调度策略：渐进式
+        self.sparsity_patience = 3  # 稀疏度调整的耐心值
+        self.consecutive_drops = 0  # 连续下降次数
+
         # 新增：稀疏度增长控制参数
         self.max_sparsity_increase_per_epoch = 0.05  # 每轮最大稀疏度增长
-        self.sparsity_adjustment_factor = 0.8        # 稀疏度调整因子
-        self.min_accuracy_threshold = 0.6            # 最低准确率阈值
+        self.sparsity_adjustment_factor = 0.8  # 稀疏度调整因子
+        self.min_accuracy_threshold = 0.6  # 最低准确率阈值
 
         logger.info(f"🎯 Pruning schedule: {self.initial_target_sparsity:.1f} → {self.final_target_sparsity:.1f}")
         logger.info(f"📈 Max sparsity increase per epoch: {self.max_sparsity_increase_per_epoch:.2f}")
 
+    def _validate_client_update(self, update, reference_weights):
+        """验证客户端更新的有效性"""
+        if not isinstance(update, dict):
+            return False
+
+        # 检查键匹配
+        if set(update.keys()) != set(reference_weights.keys()):
+            logger.warning("Client update keys don't match server weights")
+            return False
+
+        # 检查张量形状
+        for key in update:
+            if update[key].shape != reference_weights[key].shape:
+                logger.warning(f"Shape mismatch for {key}")
+                return False
+
+        return True
+
     def distribute_task(self, client_ids):
+        """
+        ========== 修改后的任务分发，支持DP ==========
+        """
+        logger.info(f"Distributing task to {len(client_ids)} clients")
+
         server_weights = deepcopy(self.s_model.state_dict())
-        client_weight_datas = []
+        client_updates = []
 
         for i in range(len(client_ids)):
             client_id = client_ids[i]
-            weight = self.client.train_epoch(self.s_model, client_id, server_weights, self.t_model)
-            client_weight_datas.append(weight)
+            logger.info(f"Training client {client_id}")
 
-        return client_weight_datas
+            try:
+                if self.dp_trainer:
+                    # ========== DP模式：客户端返回剪裁后的更新增量 ==========
+                    update = self.client.train_epoch(self.s_model, client_id, server_weights, self.t_model)
+
+                    # 验证更新格式
+                    if self._validate_client_update(update, server_weights):
+                        client_updates.append(update)
+                        logger.info(f"🔒 Client {client_id}: Valid DP update received")
+                    else:
+                        logger.warning(f"❌ Client {client_id}: Invalid DP update, skipping")
+
+                else:
+                    # ========== 非DP模式：客户端返回完整权重 ==========
+                    weight = self.client.train_epoch(self.s_model, client_id, server_weights, self.t_model)
+                    client_updates.append(weight)
+
+            except Exception as e:
+                logger.error(f"❌ Client {client_id} training failed: {e}")
+                continue
+
+        logger.info(f"Collected updates from {len(client_updates)} clients")
+        return client_updates
 
     def federated_average(self, client_weight_datas):
-        """Federated averaging with support for real quantization."""
+        """
+        ========== 修改后的联邦平均，支持DP ==========
+        """
+        if not client_weight_datas:
+            logger.error("No client data for aggregation!")
+            return self.s_model.state_dict()
+
+        if self.dp_trainer:
+            # ========== DP模式：使用DP聚合 ==========
+            logger.info(f"🔒 Performing DP aggregation")
+
+            # 检查隐私预算
+            if not self.dp_trainer.dp_manager.can_continue_training():
+                current_eps, _ = self.dp_trainer.dp_manager.get_privacy_budget()
+                logger.error(f"🛑 Privacy budget exhausted! ε={current_eps:.4f}")
+                return self.s_model.state_dict()
+
+            # DP聚合（包含噪声添加）
+            try:
+                # 确定当前轮次
+                current_round = len(self.accuracy_history)
+
+                aggregated_update = self.dp_trainer.server_aggregation_step(
+                    client_weight_datas, current_round
+                )
+
+                if aggregated_update:
+                    # 应用聚合更新到服务器模型
+                    server_lr = getattr(self.training_args, 'server_learning_rate', 1.0)
+                    self.dp_trainer.apply_update_to_server(
+                        self.s_model,
+                        aggregated_update,
+                        learning_rate=server_lr
+                    )
+
+                    # 输出隐私状态
+                    privacy_status = self.dp_trainer.get_privacy_status()
+                    logger.info(f"🔒 Privacy status:")
+                    logger.info(f"   ε: {privacy_status['current_epsilon']:.4f}/{privacy_status['target_epsilon']:.4f}")
+                    logger.info(f"   Budget used: {privacy_status['budget_utilization']:.1%}")
+                    logger.info(f"   Remaining: {privacy_status['remaining_budget']:.4f}")
+
+                return self.s_model.state_dict()
+
+            except Exception as e:
+                logger.error(f"❌ DP aggregation failed: {e}")
+                return self.s_model.state_dict()
+
+        else:
+            # ========== 非DP模式：原有联邦平均 ==========
+            return self._original_federated_average(client_weight_datas)
+
+    def _original_federated_average(self, client_weight_datas):
+        """原有的联邦平均实现"""
         # Validate and process client weights
         valid_client_weights = self._validate_and_process_client_weights(client_weight_datas)
         client_num = len(valid_client_weights)
@@ -534,6 +748,12 @@ class Server():
                 self.training_args.global_noise_type.lower() == 'laplace' and
                 hasattr(self.training_args, 'global_noise_scale') and
                 self.training_args.global_noise_scale > 0):
+
+            # 如果启用了DP，警告用户不要同时使用两种噪声机制
+            if self.dp_trainer:
+                logger.warning("⚠️  Both DP and legacy Laplacian noise enabled! Using DP only.")
+                return aggregated_w
+
             reduced_noise_scale = min(self.training_args.global_noise_scale, 0.01)
             final_w = add_laplacian_noise_to_state_dict(aggregated_w, reduced_noise_scale)
             logger.info(f"Applied reduced noise scale: {reduced_noise_scale}")
@@ -554,7 +774,8 @@ class Server():
         if len(self.accuracy_history) >= 3:
             recent_accuracies = self.accuracy_history[-3:]
             if all(acc < self.min_accuracy_threshold for acc in recent_accuracies):
-                logger.warning(f"🚨 Accuracy consistently below {self.min_accuracy_threshold}! Possible training instability.")
+                logger.warning(
+                    f"🚨 Accuracy consistently below {self.min_accuracy_threshold}! Possible training instability.")
                 return True
             if len(self.accuracy_history) >= 2:
                 prev_acc = self.accuracy_history[-2]
@@ -563,6 +784,39 @@ class Server():
                     return True
 
         return False
+
+    def _log_dp_progress(self, epoch):
+        """记录DP训练进度"""
+        if not self.dp_trainer:
+            return
+
+        privacy_status = self.dp_trainer.get_privacy_status()
+        stats = self.dp_trainer.dp_manager.get_statistics()
+
+        logger.info(f"📊 DP Progress [Epoch {epoch + 1}]:")
+        logger.info(f"   🔒 Privacy: ε={privacy_status['current_epsilon']:.4f}/"
+                    f"{privacy_status['target_epsilon']:.4f} "
+                    f"({privacy_status['budget_utilization']:.1%})")
+        logger.info(f"   ✂️  Clipping: {stats['clipping_rate']:.1%} of updates clipped")
+        logger.info(f"   📉 Remaining budget: {privacy_status['remaining_budget']:.4f}")
+
+    def _log_final_dp_summary(self):
+        """记录最终DP摘要"""
+        if not self.dp_trainer:
+            return
+
+        training_summary = self.dp_trainer.get_training_summary()
+        privacy_status = self.dp_trainer.get_privacy_status()
+
+        logger.info("🎉 === DP TRAINING COMPLETED ===")
+        logger.info(f"🔒 Final Privacy Consumption:")
+        logger.info(f"   ε = {privacy_status['current_epsilon']:.4f} / {privacy_status['target_epsilon']:.4f}")
+        logger.info(f"   δ = {privacy_status['delta']}")
+        logger.info(f"   Budget utilization: {privacy_status['budget_utilization']:.1%}")
+        logger.info(f"📈 Training Statistics:")
+        logger.info(f"   Total rounds: {training_summary['total_rounds']}")
+        logger.info(f"   Total clients trained: {training_summary['total_clients_trained']}")
+        logger.info(f"   Avg clients per round: {training_summary['avg_clients_per_round']:.1f}")
 
     def evalute(self):
         # Check if model weights are normal before evaluation
@@ -654,20 +908,20 @@ class Server():
         """
         # 获取当前稀疏度目标
         current_target_sparsity = self.client.distill_args.target_sparsity
-        
+
         # 🔧 核心修复：正确的稀疏度增长逻辑
         # 基于epoch的基础调度
         if self.sparsity_schedule == 'gradual':
             # 线性增长：从initial_target_sparsity到final_target_sparsity
             progress = min(current_epoch / (self.epochs * 0.8), 1.0)  # 在80%的训练时间内完成剪枝
             base_target_sparsity = self.initial_target_sparsity + progress * (
-                self.final_target_sparsity - self.initial_target_sparsity
+                    self.final_target_sparsity - self.initial_target_sparsity
             )
         elif self.sparsity_schedule == 'aggressive':
             # 更激进的调度
             progress = min(current_epoch / (self.epochs * 0.6), 1.0)  # 在60%的训练时间内完成剪枝
             base_target_sparsity = self.initial_target_sparsity + progress * (
-                self.final_target_sparsity - self.initial_target_sparsity
+                    self.final_target_sparsity - self.initial_target_sparsity
             )
         else:
             # 固定稀疏度
@@ -675,23 +929,23 @@ class Server():
 
         # 🔧 自适应调整：基于准确率变化
         new_target_sparsity = base_target_sparsity
-        
+
         if len(self.accuracy_history) >= 2:
             recent_acc = self.accuracy_history[-1]
             prev_acc = self.accuracy_history[-2]
-            
+
             if recent_acc < prev_acc:
                 # 准确率下降，减缓剪枝速度
                 self.consecutive_drops += 1
                 logger.warning(
                     f"📉 Accuracy dropped: {prev_acc:.4f} → {recent_acc:.4f} (consecutive drops: {self.consecutive_drops})")
-                
+
                 if self.consecutive_drops >= self.sparsity_patience:
                     # 多次连续下降，显著减缓剪枝
                     sparsity_increase = base_target_sparsity - current_target_sparsity
                     adjusted_increase = sparsity_increase * self.sparsity_adjustment_factor
                     new_target_sparsity = current_target_sparsity + adjusted_increase
-                    
+
                     logger.warning(f"🚨 Slowing down pruning due to {self.consecutive_drops} consecutive accuracy drops")
                     logger.info(f"🔧 Reduced sparsity increase: {sparsity_increase:.4f} → {adjusted_increase:.4f}")
                 else:
@@ -703,35 +957,35 @@ class Server():
                 # 准确率稳定或上升，正常调度
                 self.consecutive_drops = 0
                 new_target_sparsity = base_target_sparsity
-        
+
         # 🔧 关键修复：确保稀疏度单调递增且有界
         # 1. 不能低于当前稀疏度（单调递增）
         new_target_sparsity = max(new_target_sparsity, current_target_sparsity)
-        
+
         # 2. 限制每轮的最大增长
         max_allowed_sparsity = current_target_sparsity + self.max_sparsity_increase_per_epoch
         new_target_sparsity = min(new_target_sparsity, max_allowed_sparsity)
-        
+
         # 3. 不能超过最终目标
         new_target_sparsity = min(new_target_sparsity, self.final_target_sparsity)
-        
+
         # 4. 确保在合理范围内
         new_target_sparsity = max(new_target_sparsity, 0.0)
         new_target_sparsity = min(new_target_sparsity, 0.95)  # 最多剪枝95%
-        
-        # 🔧 应用新的稀疏度目标
+
+        # 应用新的稀疏度目标
         if abs(new_target_sparsity - current_target_sparsity) > 0.001:  # 避免无意义的微小更新
             sparsity_increase = new_target_sparsity - current_target_sparsity
             progress_percentage = (new_target_sparsity - self.initial_target_sparsity) / (
-                self.final_target_sparsity - self.initial_target_sparsity) * 100
-            
+                    self.final_target_sparsity - self.initial_target_sparsity) * 100
+
             logger.info(f"🎯 Sparsity update: {current_target_sparsity:.4f} → {new_target_sparsity:.4f} "
-                       f"(+{sparsity_increase:.4f})")
+                        f"(+{sparsity_increase:.4f})")
             logger.info(f"📊 Pruning progress: {progress_percentage:.1f}% toward final target")
-            
+
             # 更新客户端的目标稀疏度
             self.client.distill_args.target_sparsity = new_target_sparsity
-            
+
             # 🔧 新增：直接更新模型掩码
             try:
                 # 创建一个临时trainer来访问掩码更新方法
@@ -748,28 +1002,44 @@ class Server():
                 logger.info("✅ Updated model masks with new target sparsity")
             except Exception as e:
                 logger.warning(f"Failed to update masks directly: {e}")
-        
+
         return new_target_sparsity
 
     def run(self):
         """
-        🔧 修复9: 改进的训练主循环，正确的剪枝进度控制
+        ========== 修改后的训练主循环，支持DP监控 ==========
         """
         logger.info(f"Starting federated learning with {self.epochs} epochs")
         logger.info(f"🎯 Pruning schedule: {self.initial_target_sparsity:.1f} → {self.final_target_sparsity:.1f}")
-        logger.info(f"📈 Strategy: {self.sparsity_schedule}, Max increase/epoch: {self.max_sparsity_increase_per_epoch:.2f}")
-        
+        logger.info(
+            f"📈 Strategy: {self.sparsity_schedule}, Max increase/epoch: {self.max_sparsity_increase_per_epoch:.2f}")
+
+        # DP状态显示
+        if self.dp_trainer:
+            privacy_status = self.dp_trainer.get_privacy_status()
+            logger.info(f"🔒 DP Protection:")
+            logger.info(f"   Target ε: {privacy_status['target_epsilon']}")
+            logger.info(f"   Clipping bound: {self.training_args.dp_clipping_bound}")
+            logger.info(f"   Noise multiplier: {self.training_args.dp_noise_multiplier}")
+
         # 设置初始稀疏度
         self.client.distill_args.target_sparsity = self.initial_target_sparsity
-        
+
         for epoch in range(self.epochs):
-            logger.info(f"=== Epoch: {epoch+1}/{self.epochs} ===")
-            
+            logger.info(f"=== Epoch: {epoch + 1}/{self.epochs} ===")
+
+            # ========== DP预算检查 ==========
+            if self.dp_trainer and not self.dp_trainer.dp_manager.can_continue_training():
+                current_eps, _ = self.dp_trainer.dp_manager.get_privacy_budget()
+                logger.error(f"🛑 Training stopped: Privacy budget exhausted at epoch {epoch + 1}!")
+                logger.error(f"Final ε = {current_eps:.4f} > target {self.training_args.dp_target_epsilon}")
+                break
+
             # 显示当前剪枝状态
             current_target = self.client.distill_args.target_sparsity
             progress = (current_target - self.initial_target_sparsity) / (
-                self.final_target_sparsity - self.initial_target_sparsity) * 100
-            logger.info(f"🎯 Current target sparsity: {current_target:.4f} ({current_target*100:.1f}%)")
+                    self.final_target_sparsity - self.initial_target_sparsity) * 100
+            logger.info(f"🎯 Current target sparsity: {current_target:.4f} ({current_target * 100:.1f}%)")
             logger.info(f"📊 Pruning progress: {progress:.1f}%")
 
             # 执行联邦训练
@@ -784,35 +1054,49 @@ class Server():
             current_accuracy = self.accuracy_history[-1] if self.accuracy_history else 0.0
             new_sparsity = self.adaptive_sparsity_scheduling(epoch, current_accuracy)
 
+            # ========== DP统计输出 ==========
+            if self.dp_trainer and epoch % 2 == 0:
+                self._log_dp_progress(epoch)
+
             # 早停检查（准确率持续过低）
             if len(self.accuracy_history) >= 5:
                 recent_accuracies = self.accuracy_history[-5:]
                 if all(acc < self.min_accuracy_threshold for acc in recent_accuracies):
-                    logger.error(f"🛑 Training stopped: Accuracy below {self.min_accuracy_threshold} for 5 consecutive epochs")
+                    logger.error(
+                        f"🛑 Training stopped: Accuracy below {self.min_accuracy_threshold} for 5 consecutive epochs")
                     logger.error("🔧 Recommendations:")
                     logger.error(f"   1. Reduce final target sparsity (current: {self.final_target_sparsity})")
                     logger.error(f"   2. Use more gradual sparsity schedule")
                     logger.error(f"   3. Increase sparsity patience (current: {self.sparsity_patience})")
-                    logger.error(f"   4. Reduce max sparsity increase per epoch (current: {self.max_sparsity_increase_per_epoch})")
+                    logger.error(
+                        f"   4. Reduce max sparsity increase per epoch (current: {self.max_sparsity_increase_per_epoch})")
                     break
 
             # 检查是否达到最终目标
             if abs(new_sparsity - self.final_target_sparsity) < 0.01:
                 logger.info(f"🎉 Reached target sparsity: {new_sparsity:.4f}")
-                
+
             logger.info("=" * 50)
 
-        # 训练完成总结
+        # ========== 训练完成总结 ==========
         logger.info("🎉 FEDERATED LEARNING COMPLETED")
+
+        # 准确率总结
         if hasattr(self, 'accuracy_history') and self.accuracy_history:
             final_acc = self.accuracy_history[-1]
             best_acc = max(self.accuracy_history)
             logger.info(f"📊 Final accuracy: {final_acc:.4f}")
             logger.info(f"📊 Best accuracy: {best_acc:.4f}")
-        
+
+        # 剪枝总结
         final_sparsity = self.client.distill_args.target_sparsity
         achieved_progress = (final_sparsity - self.initial_target_sparsity) / (
-            self.final_target_sparsity - self.initial_target_sparsity) * 100
+                self.final_target_sparsity - self.initial_target_sparsity) * 100
         logger.info(f"🎯 Final target sparsity: {final_sparsity:.4f}")
         logger.info(f"📈 Pruning progress achieved: {achieved_progress:.1f}%")
+
+        # ========== DP总结 ==========
+        if self.dp_trainer:
+            self._log_final_dp_summary()
+
         logger.info("=" * 50)
